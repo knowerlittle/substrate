@@ -681,6 +681,52 @@ fn dispatch_call_not_dispatched_after_top_level_transaction_failure() {
 	});
 }
 
+const CODE_RUN_OUT_OF_GAS: &str = r#"
+(module
+	(import "env" "memory" (memory 1 1))
+
+	(func (export "call")
+		(loop) ;; just run out of gas
+		(unreachable)
+	)
+	(func (export "deploy"))
+)
+"#;
+
+#[test]
+fn run_out_of_gas() {
+
+	let (wasm, code_hash) = compile_module::<Test>(CODE_RUN_OUT_OF_GAS).unwrap();
+
+	ExtBuilder::default().existential_deposit(50).build().execute_with(|| {
+		Balances::deposit_creating(&ALICE, 1_000_000);
+
+		assert_ok!(Contract::put_code(Origin::signed(ALICE), 100_000, wasm));
+
+		assert_ok!(Contract::instantiate(
+			Origin::signed(ALICE),
+			100,
+			100_000,
+			code_hash.into(),
+			vec![],
+		));
+
+		// Call the newly instantiated contract. The contract is expected to dispatch a call
+		// and then trap.
+		assert_err!(
+			Contract::call(
+				Origin::signed(ALICE),
+				BOB, // newly created account
+				0,
+				100_000,
+				vec![],
+			),
+			"ran out of gas during contract execution"
+		);
+	});
+}
+
+
 const CODE_SET_RENT: &str = r#"
 (module
 	(import "env" "ext_dispatch_call" (func $ext_dispatch_call (param i32 i32)))
