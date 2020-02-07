@@ -24,10 +24,9 @@ use std::time::Duration;
 use std::task::{Poll, Context};
 use log::info;
 use tempfile::TempDir;
+use tokio::runtime::Runtime;
 use futures::prelude::*;
 use futures::future::ready;
-use async_std::stream::interval;
-use async_std::prelude::FutureExt;
 use sc_service::{
 	AbstractService,
 	ChainSpec,
@@ -40,11 +39,14 @@ use sc_network::{multiaddr, Multiaddr, NetworkStateInfo};
 use sc_network::config::{NetworkConfiguration, TransportConfig, NodeKeyConfig, Secret, NonReservedPeerMode};
 use sp_runtime::{generic::BlockId, traits::Block as BlockT};
 use sp_transaction_pool::TransactionPool;
+use async_std::stream::interval;
+use async_std::prelude::FutureExt;
 
 /// Maximum duration of single wait call.
 const MAX_WAIT_TIME: Duration = Duration::from_secs(60 * 3);
 
 struct TestNet<G, E, F, L, U> {
+	runtime: Runtime,
 	authority_nodes: Vec<(usize, SyncService<F>, U, Multiaddr)>,
 	full_nodes: Vec<(usize, SyncService<F>, U, Multiaddr)>,
 	light_nodes: Vec<(usize, SyncService<L>, Multiaddr)>,
@@ -96,7 +98,7 @@ where F: Send + 'static, L: Send +'static, U: Clone + Send + 'static
 	{
 		let full_nodes = self.full_nodes.clone();
 		let light_nodes = self.light_nodes.clone();
-		let interval = interval(Duration::from_millis(100))
+		let interval = interval(Duration::from_millis(500))
 			.take_while(move |_| {
 				let num_full_ready = full_nodes.iter().filter(|&(ref id, ref service, _, _)|
 					full_predicate(*id, service)
@@ -120,7 +122,7 @@ where F: Send + 'static, L: Send +'static, U: Clone + Send + 'static
 			.for_each(|_| ready(()))
 			.timeout(MAX_WAIT_TIME);
 
-		match futures::executor::block_on(interval) {
+		match self.runtime.block_on(interval) {
 			Ok(()) => {},
 			Err(_) => panic!("Waited for too long"),
 		}
@@ -228,7 +230,9 @@ impl<G, E, F, L, U> TestNet<G, E, F, L, U> where
 	) -> TestNet<G, E, F, L, U> {
 		let _ = env_logger::try_init();
 		fdlimit::raise_fd_limit();
+		let runtime = Runtime::new().expect("Error creating tokio runtime");
 		let mut net = TestNet {
+			runtime,
 			authority_nodes: Default::default(),
 			full_nodes: Default::default(),
 			light_nodes: Default::default(),
@@ -247,14 +251,18 @@ impl<G, E, F, L, U> TestNet<G, E, F, L, U> where
 		light: impl Iterator<Item = impl FnOnce(Configuration<G, E>) -> Result<L, Error>>,
 		authorities: impl Iterator<Item = (String, impl FnOnce(Configuration<G, E>) -> Result<(F, U), Error>)>
 	) {
-		let task_executor = Arc::new(Box::new(|fut | { async_std::task::spawn(fut); }));
+		let handle = self.runtime.handle();
 
 		for (key, authority) in authorities {
+			let task_executor = {
+				let handle = handle.clone();
+				Arc::new(move |fut| { handle.spawn(fut); })
+			};
 			let node_config = node_config(
 				self.nodes,
 				&self.chain_spec,
 				Roles::AUTHORITY,
-				task_executor.clone(),
+				task_executor,
 				Some(key),
 				self.base_port,
 				&temp,
@@ -263,30 +271,38 @@ impl<G, E, F, L, U> TestNet<G, E, F, L, U> where
 			let (service, user_data) = authority(node_config).expect("Error creating test node service");
 			let service = SyncService::from(service);
 
-			async_std::task::spawn(service.clone().map_err(|_| ()));
+			handle.spawn(service.clone().map_err(|_| ()));
 			let addr = addr.with(multiaddr::Protocol::P2p(service.get().network().local_peer_id().into()));
 			self.authority_nodes.push((self.nodes, service, user_data, addr));
 			self.nodes += 1;
 		}
 
 		for full in full {
-			let node_config = node_config(self.nodes, &self.chain_spec, Roles::FULL, task_executor.clone(), None, self.base_port, &temp);
+			let task_executor = {
+				let handle = handle.clone();
+				Arc::new(move |fut| { handle.spawn(fut); })
+			};
+			let node_config = node_config(self.nodes, &self.chain_spec, Roles::FULL, task_executor, None, self.base_port, &temp);
 			let addr = node_config.network.listen_addresses.iter().next().unwrap().clone();
 			let (service, user_data) = full(node_config).expect("Error creating test node service");
 			let service = SyncService::from(service);
 
-			async_std::task::spawn(service.clone().map_err(|_| ()));
+			handle.spawn(service.clone().map_err(|_| ()));
 			let addr = addr.with(multiaddr::Protocol::P2p(service.get().network().local_peer_id().into()));
 			self.full_nodes.push((self.nodes, service, user_data, addr));
 			self.nodes += 1;
 		}
 
 		for light in light {
-			let node_config = node_config(self.nodes, &self.chain_spec, Roles::LIGHT, task_executor.clone(), None, self.base_port, &temp);
+			let task_executor = {
+				let handle = handle.clone();
+				Arc::new(move |fut| { handle.spawn(fut); })
+			};
+			let node_config = node_config(self.nodes, &self.chain_spec, Roles::LIGHT, task_executor, None, self.base_port, &temp);
 			let addr = node_config.network.listen_addresses.iter().next().unwrap().clone();
 			let service = SyncService::from(light(node_config).expect("Error creating test node service"));
 
-			async_std::task::spawn(service.clone().map_err(|_| ()));
+			handle.spawn(service.clone().map_err(|_| ()));
 			let addr = addr.with(multiaddr::Protocol::P2p(service.get().network().local_peer_id().into()));
 			self.light_nodes.push((self.nodes, service, addr));
 			self.nodes += 1;
@@ -317,73 +333,83 @@ pub fn connectivity<G, E, Fb, F, Lb, L>(
 
 	{
 		let temp = tempdir_with_prefix("substrate-connectivity-test");
-		let mut network = TestNet::new(
-			&temp,
-			spec.clone(),
-			(0..NUM_FULL_NODES).map(|_| { |cfg| full_builder(cfg).map(|s| (s, ())) }),
-			(0..NUM_LIGHT_NODES).map(|_| { |cfg| light_builder(cfg) }),
-			// Note: this iterator is empty but we can't just use `iter::empty()`, otherwise
-			// the type of the closure cannot be inferred.
-			(0..0).map(|_| (String::new(), { |cfg| full_builder(cfg).map(|s| (s, ())) })),
-			30400,
-		);
-		info!("Checking star topology");
-		let first_address = network.full_nodes[0].3.clone();
-		for (_, service, _, _) in network.full_nodes.iter().skip(1) {
-			service.get().network().add_reserved_peer(first_address.to_string())
-				.expect("Error adding reserved peer");
-		}
-		for (_, service, _) in network.light_nodes.iter() {
-			service.get().network().add_reserved_peer(first_address.to_string())
-				.expect("Error adding reserved peer");
-		}
+		let runtime = {
+			let mut network = TestNet::new(
+				&temp,
+				spec.clone(),
+				(0..NUM_FULL_NODES).map(|_| { |cfg| full_builder(cfg).map(|s| (s, ())) }),
+				(0..NUM_LIGHT_NODES).map(|_| { |cfg| light_builder(cfg) }),
+				// Note: this iterator is empty but we can't just use `iter::empty()`, otherwise
+				// the type of the closure cannot be inferred.
+				(0..0).map(|_| (String::new(), { |cfg| full_builder(cfg).map(|s| (s, ())) })),
+				30400,
+			);
+			info!("Checking star topology");
+			let first_address = network.full_nodes[0].3.clone();
+			for (_, service, _, _) in network.full_nodes.iter().skip(1) {
+				service.get().network().add_reserved_peer(first_address.to_string())
+					.expect("Error adding reserved peer");
+			}
+			for (_, service, _) in network.light_nodes.iter() {
+				service.get().network().add_reserved_peer(first_address.to_string())
+					.expect("Error adding reserved peer");
+			}
 
-		network.run_until_all_full(
-			move |_index, service| service.get().network().num_connected()
-				== expected_full_connections,
-			move |_index, service| service.get().network().num_connected()
-				== expected_light_connections,
-		);
+			network.run_until_all_full(
+				move |_index, service| service.get().network().num_connected()
+					== expected_full_connections,
+				move |_index, service| service.get().network().num_connected()
+					== expected_light_connections,
+			);
+
+			network.runtime
+		};
+
+		info!("dropping");
+		//runtime.shutdown_now().wait().expect("Error shutting down runtime");
+		drop(runtime);
 
 		temp.close().expect("Error removing temp dir");
 	}
 	{
 		let temp = tempdir_with_prefix("substrate-connectivity-test");
-		let mut network = TestNet::new(
-			&temp,
-			spec,
-			(0..NUM_FULL_NODES).map(|_| { |cfg| full_builder(cfg).map(|s| (s, ())) }),
-			(0..NUM_LIGHT_NODES).map(|_| { |cfg| light_builder(cfg) }),
-			// Note: this iterator is empty but we can't just use `iter::empty()`, otherwise
-			// the type of the closure cannot be inferred.
-			(0..0).map(|_| (String::new(), { |cfg| full_builder(cfg).map(|s| (s, ())) })),
-			30400,
-		);
-		info!("Checking linked topology");
-		let mut address = network.full_nodes[0].3.clone();
-		let max_nodes = std::cmp::max(NUM_FULL_NODES, NUM_LIGHT_NODES);
-		for i in 0..max_nodes {
-			if i != 0 {
-				if let Some((_, service, _, node_id)) = network.full_nodes.get(i) {
+		{
+			let mut network = TestNet::new(
+				&temp,
+				spec,
+				(0..NUM_FULL_NODES).map(|_| { |cfg| full_builder(cfg).map(|s| (s, ())) }),
+				(0..NUM_LIGHT_NODES).map(|_| { |cfg| light_builder(cfg) }),
+				// Note: this iterator is empty but we can't just use `iter::empty()`, otherwise
+				// the type of the closure cannot be inferred.
+				(0..0).map(|_| (String::new(), { |cfg| full_builder(cfg).map(|s| (s, ())) })),
+				30400,
+			);
+			info!("Checking linked topology");
+			let mut address = network.full_nodes[0].3.clone();
+			let max_nodes = std::cmp::max(NUM_FULL_NODES, NUM_LIGHT_NODES);
+			for i in 0..max_nodes {
+				if i != 0 {
+					if let Some((_, service, _, node_id)) = network.full_nodes.get(i) {
+						service.get().network().add_reserved_peer(address.to_string())
+							.expect("Error adding reserved peer");
+						address = node_id.clone();
+					}
+				}
+
+				if let Some((_, service, node_id)) = network.light_nodes.get(i) {
 					service.get().network().add_reserved_peer(address.to_string())
 						.expect("Error adding reserved peer");
 					address = node_id.clone();
 				}
 			}
 
-			if let Some((_, service, node_id)) = network.light_nodes.get(i) {
-				service.get().network().add_reserved_peer(address.to_string())
-					.expect("Error adding reserved peer");
-				address = node_id.clone();
-			}
+			network.run_until_all_full(
+				move |_index, service| service.get().network().num_connected()
+					== expected_full_connections,
+				move |_index, service| service.get().network().num_connected()
+					== expected_light_connections,
+			);
 		}
-
-		network.run_until_all_full(
-			move |_index, service| service.get().network().num_connected()
-				== expected_full_connections,
-			move |_index, service| service.get().network().num_connected()
-				== expected_light_connections,
-		);
 		temp.close().expect("Error removing temp dir");
 	}
 }
