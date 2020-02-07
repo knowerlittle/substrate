@@ -96,7 +96,7 @@ pub trait ChainApi: Send + Sync {
 	>;
 
 	/// Returns the hash of the last finalized block
-	fn last_finalized(&self) -> Result<BlockHash<Self>, Self::Error>;
+	fn last_finalized(&self) -> BlockHash<Self>;
 }
 
 /// Pool configuration options.
@@ -580,11 +580,11 @@ mod tests {
 			futures::future::ready(Ok(None))
 		}
 
-		fn block_header(&self, id: BlockId<Self::Block>) -> Result<Option<Header>, Self::Error> {
+		fn block_header(&self, _id: BlockId<Self::Block>) -> Result<Option<Header>, Self::Error> {
 			Ok(None)
 		}
 
-		fn last_finalized(&self) -> Result<BlockHash<Self>, Self::Error> {
+		fn last_finalized(&self) -> BlockHash<Self> {
 			unimplemented!()
 		}
 	}
