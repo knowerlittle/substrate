@@ -70,7 +70,6 @@ std = [
 	"primitive-types/serde",
 	"primitive-types/byteorder",
 	"primitive-types/rustc-hex",
-	"primitive-types/libc",
 	"impl-serde",
 	"codec/std",
 	"hash256-std-hasher/std",
